@@ -1,0 +1,14 @@
+#!/bin/bash
+# 🪝 Enable hooks from this directory (local core.hooksPath → scripts/versioning).
+# ⚠️ Without this, the ver stamp hooks are never called (silently).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
+HOOKS_REL=$(realpath -s --relative-to="$ROOT" "$HERE")
+
+chmod +x "$HERE/post-commit" "$HERE/stamp-version" "$HERE/install-hooks" 2>/dev/null || true
+
+git -C "$ROOT" config core.hooksPath "$HOOKS_REL"
+echo "core.hooksPath=$(git -C "$ROOT" config --get core.hooksPath)"
+echo "Hooks active for $ROOT"

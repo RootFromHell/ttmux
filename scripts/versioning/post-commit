@@ -1,0 +1,59 @@
+#!/bin/bash
+# 🏷️ post-commit: stamp ver=<parent>+1🆙 # <subject> into the commit via --amend.
+# (git add in earlier hooks does not enter the current commit → dirty tree.)
+# 📦 Guard file prevents infinite amend↔post-commit loop. SKIP_STAMP=1 — skip.
+set -euo pipefail
+
+[[ -n "${SKIP_STAMP:-}" ]] && exit 0
+
+ROOT=$(git rev-parse --show-toplevel)
+GIT_DIR=$(git rev-parse --git-dir)
+LOCK="$GIT_DIR/ttmux-ver-stamping"
+[[ -f "$LOCK" ]] && exit 0
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STAMP="$HERE/stamp-version"
+[[ -x "$STAMP" ]] || exit 0
+
+mapfile -t files < <(git -C "$ROOT" diff-tree --no-commit-id --name-only --root -r HEAD)
+((${#files[@]})) || exit 0
+
+parent=$(git -C "$ROOT" rev-parse --short 'HEAD^' 2>/dev/null || echo "0")
+ver="${parent}+1🆙"
+subject=$(git -C "$ROOT" log -1 --pretty=%s | tr -d '\r')
+subject="${subject#"${subject%%[![:space:]]*}"}"
+subject="${subject%"${subject##*[![:space:]]}"}"
+
+touch "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+if [[ -n "$subject" ]]; then
+    "$STAMP" --hash "$ver" --comment "$subject" "${files[@]}" >/dev/null || true
+else
+    "$STAMP" --hash "$ver" "${files[@]}" >/dev/null || true
+fi
+
+# Re-add versioned paths from this commit (stamp may no-op if worktree already correct)
+versioned=()
+for rel in "${files[@]}"; do
+    base=$(basename "$rel")
+    if [[ "$base" == "ttbars" || "$base" == "ttmux" || "$rel" == *.md ]]; then
+        [[ -f "$ROOT/$rel" ]] || continue
+        versioned+=("$rel")
+    fi
+done
+((${#versioned[@]})) || exit 0
+
+git -C "$ROOT" add -- "${versioned[@]}"
+if git -C "$ROOT" diff --cached --quiet; then
+    exit 0
+fi
+
+# --no-verify: skip pre-commit/commit-msg; post-commit re-enters but exits on LOCK
+# Keep author/committer from HEAD (hooks often run without user.email in the environment).
+export GIT_AUTHOR_NAME="$(git -C "$ROOT" log -1 --pretty=%an)"
+export GIT_AUTHOR_EMAIL="$(git -C "$ROOT" log -1 --pretty=%ae)"
+export GIT_AUTHOR_DATE="$(git -C "$ROOT" log -1 --pretty=%aI)"
+export GIT_COMMITTER_NAME="$(git -C "$ROOT" log -1 --pretty=%cn)"
+export GIT_COMMITTER_EMAIL="$(git -C "$ROOT" log -1 --pretty=%ce)"
+git -C "$ROOT" commit --amend --no-edit --no-verify -q
