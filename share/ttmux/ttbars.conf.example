@@ -1,0 +1,48 @@
+# Example for /etc/ttbars.conf or ~/.config/ttbars.conf
+# Copy all of it or only what you need.
+
+S1="▪"                  # filled segment       ▪ ▪ ▮ ◉ ▓ • # ▪
+S0="·"                  # empty segment        · ▫ ▯ ◯ ░ ∘ · -
+
+# Bar appearance: id="label|color|length"
+# Colors — standard or index 1-256 (red, green, cyan, brightblue, 214/c214/color214/colour214 etc.)
+# length: segment count, or nano = minimalist one-cell eight-level scale ⢀⢠⢰⢸⣸⣼⣾⣿
+# Empty label on df/zfs/btrfs → per-volume labels (*_labels or names); non-empty → group title
+cpu="CPU|colour160|10"
+ram="RAM|green|10"
+df="|cyan|5"
+zfs="|brightblue|5"
+btrfs="|brightmagenta|5"
+net_tx="↑,▲|yellow|nano"   # Second label for net_led_label_blink=on
+net_rx="↓,▼|colour151|nano"
+
+df_usage=""             # empty = real mounts (block/zfs/nfs/…; no loop/tmpfs) except df_exclude; else CSV, e.g. "/,/var"
+df_labels=""            # "ROOT,DATA" — short labels in mount order; empty = use mount names
+df_exclude=""           # "/boot,ds.*" — hidden mount points list; simple patterns ok
+
+zfs_pools=""            # empty = all pools except zfs_exclude; else CSV pool list, e.g. "data,backup"
+zfs_labels=""           # "DATA,BACKUP" — short labels in pool order; empty = use pool names
+zfs_exclude=""          # "rpool,test*" — hidden pools list
+
+btrfs_mounts=""	        # empty = all btrfs volumes; else mount list, e.g. "/mnt/data,/mnt/backup"
+btrfs_labels=""	        # "DATA,BACKUP" — short labels in volume order; empty = use volume names
+btrfs_exclude=""        # "/boot,ds.*" — hidden mount points list
+
+interface=""            # empty = auto (ip, else default route); else iface name if present
+net_max_speed=""        # scale Mbps manually; empty = sysfs speed (physical), (fallback 100)
+net_led_bytes="512"     # light-traffic detect threshold (bytes per internal sample)
+net_led_bar_boost=on    # on light traffic, force 1st scale segment (on/off)
+net_led_label_blink=off # on light traffic, signal with ▲/▼ label (on/off)
+
+# Total poll cycle duration
+measure_interval_sec=1         # default; overridden by ttbars.conf; with -tmux from tmux status-interval
+
+# Default real poll interval for each component:
+cpu_refresh_sec=0.1            # CPU, RAM, and network are sampled often and averaged over the cycle
+ram_refresh_sec=1              # df / ZFS / Btrfs metrics are sampled rarely and cached
+df_refresh_sec=30              #
+zfs_refresh_sec=30             #
+btrfs_refresh_sec=30           #
+net_refresh_sec=0.1            #
+
+quit_chars="йЙ"                # extra quit keys in watch (-t), besides q/Q; up to 10 chars (layouts)

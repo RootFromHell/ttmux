@@ -1,0 +1,1438 @@
+#!/bin/bash
+# Settings can be set in this script or via a config file:
+# system-wide `/etc/ttbars.conf` or personal `~/.config/ttbars.conf`
+S1="▪"                  # filled segment       ▪ ▪ ▮ ◉ ▓ • # ▪
+S0="·"                  # empty segment        · ▫ ▯ ◯ ░ ∘ · -
+# Bar appearance: id="label|color|length"
+cpu="CPU|color160|10"   # Colors — standard or index 1-256 (red, green, cyan, brightblue, 214/c214/color214/colour214 etc.)
+ram="RAM|green|10"      # length: segment count, or nano = minimalist one-cell eight-level scale ⢀⢠⢰⢸⣸⣼⣾⣿
+df="|cyan|5"            # Empty label on df/zfs/btrfs → per-volume labels (*_labels or names)
+zfs="|color171|5"       # non-empty → group title
+btrfs="|color202|5"
+net_tx="↑,▲|yellow|3"   # Second label for net_led_label_blink=on
+net_rx="↓,▼|color151|3"
+
+df_usage=""             # empty = real mounts (block/zfs/nfs/…; no loop/tmpfs) except df_exclude; else CSV, e.g. "/,/var"
+df_labels=""            # "ROOT,DATA" — short labels in mount order; empty = use mount names
+df_exclude=""           # "/boot,ds.*" — hidden mount points list; simple patterns ok
+zfs_pools=""            # empty = all pools except zfs_exclude; else CSV pool list, e.g. "data,backup"
+zfs_labels=""           # "DATA,BACKUP" — short labels in pool order; empty = use pool names
+zfs_exclude=""          # "rpool,test*" — hidden pools list
+btrfs_mounts=""	        # empty = all btrfs volumes; else mount list, e.g. "/mnt/data,/mnt/backup"
+btrfs_labels=""	        # "DATA,BACKUP" — short labels in volume order; empty = use volume names
+btrfs_exclude=""        # "/boot,ds.*" — hidden mount points list
+
+interface=""            # empty = auto (ip, else default route); else iface name if present
+net_max_speed=""        # scale Mbps manually; empty = sysfs speed (physical), (fallback 100)
+net_led_bytes="512"     # light-traffic detect threshold (bytes per internal sample)
+net_led_bar_boost=on    # on light traffic, force 1st scale segment (on/off)
+net_led_label_blink=off # on light traffic, signal with ▲/▼ label (on/off)
+
+# Total poll cycle duration
+measure_interval_sec=1         # default; overridden by ttbars.conf; with -tmux from tmux status-interval
+measure_deadline_ratio_pct=100 # % of measure_interval_sec for CPU/RAM/NET cycle (95 → 0.95 s)
+# Default real poll interval for each component:
+cpu_refresh_sec=0.1            # CPU, RAM, and network are sampled often and averaged over the cycle
+ram_refresh_sec=1              # df / ZFS / Btrfs metrics are sampled rarely and cached
+df_refresh_sec=30              #
+zfs_refresh_sec=30             #
+btrfs_refresh_sec=30           #
+net_refresh_sec=0.1            #
+
+quit_chars="йЙ"                # extra quit keys in watch (-t), besides q/Q; up to 10 chars (layouts)
+
+ver=0+1🆙                      # 🚀 TurboTmux: project started
+
+# bash drops the # comment from ver= — for -v read hash + subject from this file's source line
+_ttbars_print_ver() {
+    local line hash cmt
+    line=$(grep -m1 '^ver=' "$0" 2>/dev/null) || { echo "$ver"; return; }
+    if [[ "$line" =~ ^ver=([^[:space:]#]+)[[:space:]]+#[[:space:]]*(.*)$ ]]; then
+        hash=${BASH_REMATCH[1]}
+        cmt=${BASH_REMATCH[2]}
+        cmt=${cmt%"${cmt##*[![:space:]]}"}
+        echo "$hash # $cmt"
+    else
+        echo "$ver"
+    fi
+}
+
+_ttbars_out_mode="tmux"
+_ttbars_cli_mode=""
+_ttbars_watch_mode=0
+
+# max_rate — not a setting: bytes/s, computed in init_net_speed() from net_max_speed; used by net_pct_from_bps()
+max_rate=0
+
+# State file (per-user; /tmp is often root and breaks writes)
+_state_dir="${XDG_CACHE_HOME:-$HOME/.cache}"
+state_file="${TTBARS_STATE:-${_state_dir}/ttbars.state}"
+state_lock="${state_file}.lock"
+
+# Flags: df/ZFS/Btrfs lists recomputed from conf — need state_save before render
+_df_conf_dirty=0
+_zfs_conf_dirty=0
+_btrfs_conf_dirty=0
+
+# -tmux: interval from live tmux (status-interval)
+_ttbars_apply_tmux_interval() {
+    local val
+    [[ "$_ttbars_cli_mode" == "tmux" ]] || return 0
+    [[ -n "${TMUX:-}" ]] && command -v tmux &>/dev/null || return 0
+    val=$(tmux show -gv status-interval 2>/dev/null) || val=""
+    [[ "$val" =~ ^[0-9]+$ && "$val" -gt 0 ]] || return 0
+    measure_interval_sec=$val
+}
+
+# Preview colour1–colour255, then named colors (black/red/… + bright*).
+# Column-major tables; same column count; gradient runs down each column.
+# _ttbars_colour_demo_random: -1=mini (-cm), 0=random labels + fixed bar (-c),
+#   1=matched symbol pairs (-cd), 2=independent symbols (-cs)
+_ttbars_colour_demo_random=0
+# Numeric colour id right-aligned to 3 cols ("  1", " 52", "103") so table columns share one gap.
+_ttbars_colour_demo_id() {
+    local c=$1
+    if [[ "$c" =~ ^[0-9]+$ ]]; then
+        printf '%3d' "$c"
+    else
+        printf '%s' "$c"
+    fi
+}
+_ttbars_colours_table() {
+    local bar=$1 cell_w=$2 ncols=$3; shift 3
+    local -a items=("$@")
+    local -a labels=(RAM CPU SPD VOL DSK NET ZFS MNT TMP HDD SSD GPU)
+    # Matched pairs by index — same lists as S1/S0 comments above
+    local -a seg1=(▪ ▪ ▮ ◉ ▓ • '#' ▪)
+    local -a seg0=(· ▫ ▯ ◯ ░ ∘ · '-')
+    local total=${#items[@]}
+    local nrows=$(( (total + ncols - 1) / ncols ))
+    local row col i color cell pad label filled j demo_bar s1 s0 pi id
+    for ((row = 0; row < nrows; row++)); do
+        for ((col = 0; col < ncols; col++)); do
+            i=$(( col * nrows + row ))
+            if (( i >= total )); then
+                printf '%*s' "$cell_w" ''
+                continue
+            fi
+            color=${items[i]}
+            id=$(_ttbars_colour_demo_id "$color")
+            if ((_ttbars_colour_demo_random < 0)); then
+                cell="${id}"
+            elif ((_ttbars_colour_demo_random >= 1)); then
+                label=${labels[RANDOM % ${#labels[@]}]}
+                filled=$((1 + RANDOM % 4))
+                if ((_ttbars_colour_demo_random >= 2)); then
+                    s1=${seg1[RANDOM % ${#seg1[@]}]}
+                    s0=${seg0[RANDOM % ${#seg0[@]}]}
+                else
+                    pi=$(( RANDOM % ${#seg1[@]} ))
+                    s1=${seg1[pi]}; s0=${seg0[pi]}
+                fi
+                demo_bar=
+                for ((j = 0; j < filled; j++)); do demo_bar+=$s1; done
+                for ((j = filled; j < 5; j++)); do demo_bar+=$s0; done
+                cell="${label} ${demo_bar} ${id}"
+            else
+                # -c: random label, fixed bar fill
+                label=${labels[RANDOM % ${#labels[@]}]}
+                cell="${label} ${bar} ${id}"
+            fi
+            pad=$(( cell_w - $(_visible_width "$cell") ))
+            printf '%s%s%s%*s' "$(ansi_color_start "$color")" "$cell" "$(ansi_color_reset)" "$pad" ''
+        done
+        printf '\n'
+    done
+}
+
+_ttbars_show_colours() {
+    local random=${1:-0} bar cell_w term_cols ncols w1 w2 n
+    local -a nums=() named=(
+        black brightblack white brightwhite red brightred yellow brightyellow
+        green brightgreen cyan brightcyan blue brightblue magenta brightmagenta 
+    )
+    for ((n = 1; n <= 255; n++)); do nums+=("$n"); done
+    _ttbars_colour_demo_random=$random
+    if ((random < 0)); then
+        w1=$(_visible_width "255")
+        w2=$(_visible_width "brightmagenta")
+    elif ((random)); then
+        bar="${S1}${S1}${S1}${S1}${S1}"
+        w1=$(_visible_width "DSK ${bar} 255")
+        w2=$(_visible_width "DSK ${bar} brightmagenta")
+    else
+        bar="${S1}${S1}${S1}${S0}${S0}"
+        w1=$(_visible_width "DSK ${bar} 255")
+        w2=$(_visible_width "DSK ${bar} brightmagenta")
+    fi
+    term_cols=$(_ttbars_term_cols)
+    # Numeric and named tables size independently — numbers stay compact.
+    cell_w=$(( w1 + 2 ))
+    ncols=$(( term_cols / cell_w ))
+    (( ncols < 1 )) && ncols=1
+    _ttbars_colours_table "$bar" "$cell_w" "$ncols" "${nums[@]}"
+    printf '\n'
+    cell_w=$(( w2 + 2 ))
+    ncols=$(( term_cols / cell_w ))
+    (( ncols < 1 )) && ncols=1
+    _ttbars_colours_table "$bar" "$cell_w" "$ncols" "${named[@]}"
+}
+
+_ttbars_parse_args() {
+    local next
+    while (($#)); do
+        case "$1" in
+            -v|--version) _ttbars_print_ver; exit 0 ;;
+            -cs) _ttbars_show_colours 2; exit 0 ;;
+            -cd) _ttbars_show_colours 1; exit 0 ;;
+            -cm) _ttbars_show_colours -1; exit 0 ;;
+            -c) _ttbars_show_colours; exit 0 ;;
+            -tmux) _ttbars_cli_mode="tmux" ;;
+            -tty) _ttbars_cli_mode="tty" ;;
+            -plain) _ttbars_cli_mode="plain" ;;
+            -t)
+                _ttbars_watch_mode=1
+                if [[ $# -ge 2 ]]; then
+                    next=$2
+                    if [[ "$next" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v n="$next" 'BEGIN { exit (n > 0) ? 0 : 1 }'; then
+                        measure_interval_sec="$next"
+                        shift
+                    fi
+                fi
+                ;;
+            -t=*)
+                _ttbars_watch_mode=1
+                next=${1#*=}
+                if [[ "$next" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v n="$next" 'BEGIN { exit (n > 0) ? 0 : 1 }'; then
+                    measure_interval_sec="$next"
+                fi
+                ;;
+        esac
+        shift
+    done
+}
+
+_ttbars_detect_out_mode() {
+    case "$_ttbars_cli_mode" in
+        tmux|tty|plain)
+            _ttbars_out_mode="$_ttbars_cli_mode"
+            return
+            ;;
+    esac
+    # auto: decide from stdout only.
+    if [[ -t 1 ]]; then
+        _ttbars_out_mode="tty"
+    else
+        _ttbars_out_mode="plain"
+    fi
+}
+
+# External config: same variables as above. Later overrides earlier.
+_ttbars_conf_files=(/etc/ttbars.conf "${XDG_CONFIG_HOME:-$HOME/.config}/ttbars.conf")
+
+# Defaults for bar composition fields — snapshot BEFORE conf. source does not clear a commented-out variable
+# (old value stays in memory), so before each re-source we restore defaults so that
+# reload behaves like a fresh start and watch does not fight other processes over shared state.
+_def_zfs_pools=$zfs_pools;       _def_zfs_labels=$zfs_labels;     _def_zfs_exclude=$zfs_exclude
+_def_btrfs_mounts=$btrfs_mounts; _def_btrfs_labels=$btrfs_labels; _def_btrfs_exclude=$btrfs_exclude
+_def_df_usage=$df_usage;         _def_df_labels=$df_labels;       _def_df_exclude=$df_exclude
+_def_cpu=$cpu; _def_ram=$ram; _def_df=$df; _def_zfs=$zfs; _def_btrfs=$btrfs
+_def_net_tx=$net_tx; _def_net_rx=$net_rx
+_ttbars_load_conf() {
+    zfs_pools=$_def_zfs_pools;       zfs_labels=$_def_zfs_labels;     zfs_exclude=$_def_zfs_exclude
+    btrfs_mounts=$_def_btrfs_mounts; btrfs_labels=$_def_btrfs_labels; btrfs_exclude=$_def_btrfs_exclude
+    df_usage=$_def_df_usage;         df_labels=$_def_df_labels;       df_exclude=$_def_df_exclude
+    cpu=$_def_cpu; ram=$_def_ram; df=$_def_df; zfs=$_def_zfs; btrfs=$_def_btrfs
+    net_tx=$_def_net_tx; net_rx=$_def_net_rx
+    local f
+    for f in "${_ttbars_conf_files[@]}"; do
+        [[ -r "$f" ]] && source "$f"
+    done
+}
+# Conf fingerprint by mtime (with ns) — watch reloads when files change.
+_ttbars_conf_mtime() { stat -c %y "${_ttbars_conf_files[@]}" 2>/dev/null | tr '\n' ' '; }
+if [[ "${TTBARS_TEST:-}" != "1" ]]; then
+    _ttbars_load_conf
+fi
+
+# In measure_* and generate_bar, percentages are integers 0–100 (usage_or_zero / validate_usage).
+
+# --- time (seconds with fraction, bash 5+) ---
+now_epoch() { date +%s.%N; }
+
+# on/off (also yes/no and 1/0 in older conf)
+ttbars_flag_on() {
+    case "${1,,}" in
+        1|on|yes|true) return 0 ;;
+    esac
+    return 1
+}
+
+refresh_due() {
+    local last_ts="$1" period="$2" now
+    [[ -z "$last_ts" || "$last_ts" == "0" ]] && return 0
+    now=$(now_epoch)
+    awk -v n="$now" -v l="$last_ts" -v p="$period" 'BEGIN { exit (n - l) >= p ? 0 : 1 }'
+}
+
+# --- state file (key=value) ---
+declare -A ST
+
+state_load() {
+    local line key val
+    ST=()
+    [[ -f "$state_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^# ]] && continue
+        [[ "$line" != *"="* ]] && continue
+        key=${line%%=*}
+        val=${line#*=}
+        ST[$key]=$val
+    done < "$state_file"
+}
+
+state_save() {
+    local key
+    {
+        echo "# ttbars state $(now_epoch)"
+        for key in "${!ST[@]}"; do
+            echo "$key=${ST[$key]}"
+        done
+    } > "${state_file}.$$" && mv "${state_file}.$$" "$state_file"
+}
+
+state_get() { echo "${ST[$1]:-}"; }
+state_set() { ST[$1]=$2; }
+
+# Ensure usage is an integer 0–100 (percent); otherwise return empty
+validate_usage() {
+    local usage="$1"
+    if [[ "$usage" =~ ^[0-9]+$ ]] && [ "$usage" -ge 0 ] && [ "$usage" -le 100 ]; then
+        echo "$usage"
+    else
+        echo ""
+    fi
+}
+
+# In generate_bar always "$(state_get …)" or "$(usage_or_zero …)" — empty $() would eat arguments.
+usage_or_zero() {
+    local v
+    v=$(validate_usage "$1")
+    echo "${v:-0}"
+}
+
+# nload-style scale: bps → % of max_rate (fixed scale, like a set limit in nload)
+net_pct_from_bps() {
+    local bps="$1" usage
+    usage=0
+    [[ "$max_rate" -gt 0 ]] && usage=$(( bps * 100 / max_rate ))
+    (( usage > 100 )) && usage=100
+    usage_or_zero "$usage"
+}
+
+# usage for one filled segment (same formula as generate_bar); nano = 8 levels in 1 glyph
+bar_one_segment_pct() {
+    local len=${1:-3}
+    [[ "$len" == "nano" ]] && len=8
+    (( len < 1 )) && len=1
+    echo $(( (50 + len - 1) / len ))
+}
+
+# 1. If interface is set manually and exists — use it
+# 2. Else like Lemmings: ip -o -4 addr show up, not lo, first with an IP
+init_net_interface() {
+    if [[ -n "$interface" && -d "/sys/class/net/$interface" ]]; then
+        return
+    fi
+    interface=""
+    local line iface
+    while IFS= read -r line; do
+        iface=$(awk '{print $2}' <<< "$line")
+        [[ -n "$iface" && "$iface" != "lo" && -d "/sys/class/net/$iface" ]] && interface=$iface && break
+    done < <(ip -o -4 addr show up 2>/dev/null)
+    if [[ -z "$interface" ]]; then
+        interface=$(ip -o route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    fi
+}
+
+# Bridge/vmbr0: port in bridge (Lemmings) — read speed from physical, counters from interface
+get_physical_iface() {
+    local iface=$1 line candidate
+    [[ -n "$iface" ]] || { echo ""; return; }
+    if command -v bridge &>/dev/null; then
+        while IFS= read -r line; do
+            candidate=$(sed -n 's/^[0-9]*: \([^ ]*\).*/\1/p' <<< "$line")
+            [[ -n "$candidate" && -d "/sys/class/net/$candidate" ]] && { echo "$candidate"; return; }
+        done < <(bridge link show master "$iface" 2>/dev/null)
+    fi
+    echo "$iface"
+}
+
+read_iface_speed_mbps() {
+    local iface=$1 path="/sys/class/net/$iface/speed" s
+    [[ -n "$iface" && -r "$path" ]] || return 1
+    s=$(<"$path")
+    [[ "$s" =~ ^[0-9]+$ && "$s" -gt 0 ]] && { echo "$s"; return 0; }
+    return 1
+}
+
+# ▲▼ scale: net_max_speed manually, else sysfs (physical iface), fallback 100 Mbps
+init_net_speed() {
+    local physical detected
+    max_speed=100
+    if [[ -n "$net_max_speed" && "$net_max_speed" =~ ^[0-9]+$ ]]; then
+        max_speed=$net_max_speed
+    elif [[ -n "$interface" ]]; then
+        physical=$(get_physical_iface "$interface")
+        if detected=$(read_iface_speed_mbps "$physical"); then
+            max_speed=$detected
+        fi
+    fi
+    max_rate=$(( max_speed * 1024 * 1024 / 8 ))
+}
+
+# 0 if name matches any CSV pattern (full path or basename; bash globs).
+name_excluded() {
+    local name="$1" patterns="$2" pat base
+    [[ -z "$patterns" ]] && return 1
+    base="${name##*/}"
+    [[ -z "$base" ]] && base="/"
+    local -a pats=()
+    IFS=',' read -ra pats <<< "${patterns// /}"
+    for pat in "${pats[@]}"; do
+        [[ -z "$pat" ]] && continue
+        [[ "$name" == $pat || "$base" == $pat ]] && return 0
+    done
+    return 1
+}
+
+# === ZFS (init_zfs_pools logic from Lemmings) ===
+zfs_pool_names=()
+zfs_display_labels=()
+
+init_zfs_pools() {
+    local -a selected_pools=()
+    local selected_csv
+    zfs_pool_names=()
+    zfs_display_labels=()
+    command -v zpool &>/dev/null || return
+
+    local pool label labels=() idx=0
+    if [[ -n "$zfs_labels" ]]; then
+        IFS=',' read -ra labels <<< "$zfs_labels"
+    fi
+
+    selected_csv="${zfs_pools// /}"
+    if [[ -n "$selected_csv" ]]; then
+        IFS=',' read -ra selected_pools <<< "$selected_csv"
+        for pool in "${selected_pools[@]}"; do
+            [[ -z "$pool" ]] && continue
+            name_excluded "$pool" "$zfs_exclude" && continue
+            zpool list -H "$pool" &>/dev/null || continue
+            zfs_pool_names+=("$pool")
+            if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+                zfs_display_labels+=("${labels[$idx]// /}")
+            else
+                zfs_display_labels+=("$pool")
+            fi
+            idx=$(( idx + 1 ))
+        done
+        return
+    fi
+
+    while IFS= read -r pool; do
+        [[ -z "$pool" ]] && continue
+        name_excluded "$pool" "$zfs_exclude" && continue
+        zfs_pool_names+=("$pool")
+        if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+            zfs_display_labels+=("${labels[$idx]// /}")
+        else
+            zfs_display_labels+=("$pool")
+        fi
+        idx=$(( idx + 1 ))
+    done < <(zpool list -Ho name 2>/dev/null)
+}
+
+# === Btrfs (same scheme as ZFS: volumes, labels, exclude, bars from state) ===
+btrfs_vols=()
+btrfs_display_labels=()
+
+# State key (btrfs_<key>): mount path without slashes, / → root
+btrfs_vol_key() {
+    local mount="$1"
+    if [[ "$mount" == "/" ]]; then
+        echo root
+    else
+        echo "${mount#/}" | tr '/' '_'
+    fi
+}
+
+init_btrfs_vols() {
+    local -a selected_mounts=()
+    local selected_csv
+    btrfs_vols=()
+    btrfs_display_labels=()
+    command -v btrfs &>/dev/null || return
+
+    local mount label labels=() idx=0
+    if [[ -n "$btrfs_labels" ]]; then
+        IFS=',' read -ra labels <<< "$btrfs_labels"
+    fi
+
+    selected_csv="${btrfs_mounts// /}"
+    if [[ -n "$selected_csv" ]]; then
+        IFS=',' read -ra selected_mounts <<< "$selected_csv"
+        for mount in "${selected_mounts[@]}"; do
+            mount="${mount// /}"
+            [[ -z "$mount" ]] && continue
+            name_excluded "$mount" "$btrfs_exclude" && continue
+            findmnt -T "$mount" -t btrfs &>/dev/null || continue
+            btrfs_vols+=("$mount")
+            if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+                btrfs_display_labels+=("${labels[$idx]// /}")
+            elif [[ "$mount" == "/" ]]; then
+                btrfs_display_labels+=(root)
+            else
+                btrfs_display_labels+=("$(basename "$mount")")
+            fi
+            idx=$(( idx + 1 ))
+        done
+        return
+    fi
+
+    while IFS= read -r mount; do
+        [[ -z "$mount" ]] && continue
+        name_excluded "$mount" "$btrfs_exclude" && continue
+        btrfs_vols+=("$mount")
+        if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+            btrfs_display_labels+=("${labels[$idx]// /}")
+        elif [[ "$mount" == "/" ]]; then
+            btrfs_display_labels+=(root)
+        else
+            btrfs_display_labels+=("$(basename "$mount")")
+        fi
+        idx=$(( idx + 1 ))
+    done < <(findmnt -t btrfs -n -o TARGET -r 2>/dev/null | sort -u)
+}
+
+# === df (same scheme as Btrfs: mounts, labels, exclude, bars from state) ===
+df_vols=()
+df_display_labels=()
+
+# State key (df_<key>): mount path without slashes, / → root
+df_vol_key() {
+    local mount="$1"
+    if [[ "$mount" == "/" ]]; then
+        echo root
+    else
+        echo "${mount#/}" | tr '/' '_'
+    fi
+}
+
+init_df_vols() {
+    local -a selected_mounts=()
+    local selected_csv
+    df_vols=()
+    df_display_labels=()
+
+    local mount labels=() idx=0
+    if [[ -n "$df_labels" ]]; then
+        IFS=',' read -ra labels <<< "$df_labels"
+    fi
+
+    selected_csv="${df_usage// /}"
+    if [[ -n "$selected_csv" ]]; then
+        IFS=',' read -ra selected_mounts <<< "$selected_csv"
+        for mount in "${selected_mounts[@]}"; do
+            mount="${mount// /}"
+            [[ -z "$mount" ]] && continue
+            name_excluded "$mount" "$df_exclude" && continue
+            findmnt -T "$mount" &>/dev/null || continue
+            df_vols+=("$mount")
+            if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+                df_display_labels+=("${labels[$idx]// /}")
+            elif [[ "$mount" == "/" ]]; then
+                df_display_labels+=(root)
+            else
+                df_display_labels+=("$(basename "$mount")")
+            fi
+            idx=$(( idx + 1 ))
+        done
+        return
+    fi
+
+    while IFS= read -r mount; do
+        [[ -z "$mount" ]] && continue
+        name_excluded "$mount" "$df_exclude" && continue
+        df_vols+=("$mount")
+        if [[ $idx -lt ${#labels[@]} && -n "${labels[$idx]// /}" ]]; then
+            df_display_labels+=("${labels[$idx]// /}")
+        elif [[ "$mount" == "/" ]]; then
+            df_display_labels+=(root)
+        else
+            df_display_labels+=("$(basename "$mount")")
+        fi
+        idx=$(( idx + 1 ))
+    done < <(df -P -x tmpfs -x devtmpfs -x squashfs -x efivarfs -x proc -x sysfs \
+        -x cgroup -x cgroup2 -x autofs -x mqueue -x fusectl -x debugfs -x securityfs \
+        -x pstore -x bpf -x ramfs -x hugetlbfs -x configfs -x tracefs -x nsfs 2>/dev/null \
+        | awk 'NR>1 && $1 != "none" && $1 !~ /^\/dev\/loop/ && $6 !~ /^\/(dev|proc|sys)(\/|$)/ {print $6}' \
+        | sort -u)
+}
+
+# df used % for a mount point
+measure_df_pct() {
+    local mount="$1"
+    [[ -z "$mount" ]] && { echo 0; return; }
+    df -P "$mount" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+}
+
+# get usage percent (CAP)
+measure_zfs_pct() {
+    local pool="$1"
+    [[ -z "$pool" ]] && { echo 0; return; }
+    zpool list -H -o capacity "$pool" 2>/dev/null | tr -d '%'
+}
+
+# Btrfs: used % like ZFS CAP — `btrfs filesystem usage -b` (Used / Device size)
+measure_btrfs_pct() {
+    local mount="$1"
+    [[ -z "$mount" ]] && { echo 0; return; }
+    btrfs filesystem usage -b "$mount" 2>/dev/null | awk '
+        /^[[:space:]]*Device size:/ { size = $NF }
+        /^[[:space:]]*Used:/ { used = $NF }
+        END {
+            if (size + 0 > 0)
+                printf "%d\n", used * 100 / size
+            else
+                print 0
+        }'
+}
+
+# RAM: /proc/meminfo — locale-independent (MemTotal:/MemAvailable:)
+measure_ram_pct() {
+    local total avail
+    total=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
+    avail=$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)
+    [[ -z "$total" || "$total" -le 0 ]] && { echo 0; return; }
+    echo $(( (total - avail) * 100 / total ))
+}
+
+# CPU: snapshot of cpu line from /proc/stat → "total idle" on one line
+read_cpu_totals() {
+    local -a fields=()
+    local total=0 v idle1
+    read -r -a fields < <(grep '^cpu ' /proc/stat)
+    [[ ${#fields[@]} -lt 5 ]] && { echo "0 0"; return; }
+    idle1=${fields[4]}
+    for v in "${fields[@]:1:7}"; do total=$(( total + v )); done
+    echo "$total $idle1"
+}
+
+cpu_usage_from_snapshots() {
+    local t1="$1" i1="$2" t2="$3" i2="$4" total_diff idle_diff usage
+    total_diff=$(( t2 - t1 ))
+    idle_diff=$(( i2 - i1 ))
+    [[ "$total_diff" -le 0 ]] && { echo 0; return; }
+    usage=$(( 100 * (total_diff - idle_diff) / total_diff ))
+    usage_or_zero "$usage"
+}
+
+# Slow metrics: df, ZFS, Btrfs — on schedule into the file, otherwise from the file
+# Bar composition (mount/pool/volume lists) — immediately on conf change; % poll — per df/zfs/btrfs_refresh_sec.
+refresh_slow_metrics() {
+    local pool pct i mount key df_sig zfs_sig btrfs_sig
+
+    df_sig="${df_usage}|${df_labels}|${df_exclude}"
+    if [[ "$(state_get df_conf_sig)" != "$df_sig" ]]; then
+        _df_conf_dirty=1
+        state_set df_conf_sig "$df_sig"
+        init_df_vols
+        state_set df_vol_list "$(IFS='|'; echo "${df_vols[*]}")"
+        state_set df_label_list "$(IFS='|'; echo "${df_display_labels[*]}")"
+    elif [[ -n "${df_usage// /}" && -n "$(state_get df_vol_list)" ]]; then
+        local _m
+        for _m in $(tr '|' ' ' <<< "$(state_get df_vol_list)"); do
+            name_excluded "$_m" "$df_exclude" && { _df_conf_dirty=1; break; }
+        done
+        if (( _df_conf_dirty )); then
+            init_df_vols
+            state_set df_vol_list "$(IFS='|'; echo "${df_vols[*]}")"
+            state_set df_label_list "$(IFS='|'; echo "${df_display_labels[*]}")"
+        fi
+    fi
+
+    if refresh_due "$(state_get df_ts)" "$df_refresh_sec" || [[ -z "$(state_get df_vol_list)" ]]; then
+        if [[ -z "${df_usage// /}" ]] || [[ -z "$(state_get df_vol_list)" ]]; then
+            init_df_vols
+            state_set df_vol_list "$(IFS='|'; echo "${df_vols[*]}")"
+            state_set df_label_list "$(IFS='|'; echo "${df_display_labels[*]}")"
+        else
+            IFS='|' read -ra df_vols <<< "$(state_get df_vol_list)"
+        fi
+        for i in "${!df_vols[@]}"; do
+            mount=${df_vols[$i]}
+            key=$(df_vol_key "$mount")
+            pct=$(measure_df_pct "$mount")
+            pct=$(usage_or_zero "$pct")
+            state_set "df_${key}" "$pct"
+        done
+        state_set df_ts "$(now_epoch)"
+    fi
+
+    zfs_sig="${zfs_pools}|${zfs_labels}|${zfs_exclude}"
+    if [[ "$(state_get zfs_conf_sig)" != "$zfs_sig" ]]; then
+        _zfs_conf_dirty=1
+        state_set zfs_conf_sig "$zfs_sig"
+        init_zfs_pools
+        state_set zfs_pool_list "$(IFS=,; echo "${zfs_pool_names[*]}")"
+        state_set zfs_label_list "$(IFS=,; echo "${zfs_display_labels[*]}")"
+    elif [[ -n "${zfs_pools// /}" && -n "$(state_get zfs_pool_list)" ]]; then
+        # state may be left from older code (exclude was not applied to whitelist)
+        local _pl
+        for _pl in $(tr ',' ' ' <<< "$(state_get zfs_pool_list)"); do
+            name_excluded "$_pl" "$zfs_exclude" && { _zfs_conf_dirty=1; break; }
+        done
+        if (( _zfs_conf_dirty )); then
+            init_zfs_pools
+            state_set zfs_pool_list "$(IFS=,; echo "${zfs_pool_names[*]}")"
+            state_set zfs_label_list "$(IFS=,; echo "${zfs_display_labels[*]}")"
+        fi
+    fi
+
+    if refresh_due "$(state_get zfs_ts)" "$zfs_refresh_sec"; then
+        if [[ -z "${zfs_pools// /}" ]]; then
+            init_zfs_pools
+            state_set zfs_pool_list "$(IFS=,; echo "${zfs_pool_names[*]}")"
+            state_set zfs_label_list "$(IFS=,; echo "${zfs_display_labels[*]}")"
+        else
+            IFS=',' read -ra zfs_pool_names <<< "$(state_get zfs_pool_list)"
+        fi
+        for i in "${!zfs_pool_names[@]}"; do
+            pool=${zfs_pool_names[$i]}
+            pct=$(measure_zfs_pct "$pool")
+            pct=$(usage_or_zero "$pct")
+            state_set "zfs_${pool}" "$pct"
+        done
+        state_set zfs_ts "$(now_epoch)"
+    fi
+
+    btrfs_sig="${btrfs_mounts}|${btrfs_labels}|${btrfs_exclude}"
+    if [[ "$(state_get btrfs_conf_sig)" != "$btrfs_sig" ]]; then
+        _btrfs_conf_dirty=1
+        state_set btrfs_conf_sig "$btrfs_sig"
+        init_btrfs_vols
+        state_set btrfs_vol_list "$(IFS='|'; echo "${btrfs_vols[*]}")"
+        state_set btrfs_label_list "$(IFS='|'; echo "${btrfs_display_labels[*]}")"
+    elif [[ -n "${btrfs_mounts// /}" && -n "$(state_get btrfs_vol_list)" ]]; then
+        local _m
+        for _m in $(tr '|' ' ' <<< "$(state_get btrfs_vol_list)"); do
+            name_excluded "$_m" "$btrfs_exclude" && { _btrfs_conf_dirty=1; break; }
+        done
+        if (( _btrfs_conf_dirty )); then
+            init_btrfs_vols
+            state_set btrfs_vol_list "$(IFS='|'; echo "${btrfs_vols[*]}")"
+            state_set btrfs_label_list "$(IFS='|'; echo "${btrfs_display_labels[*]}")"
+        fi
+    fi
+
+    if refresh_due "$(state_get btrfs_ts)" "$btrfs_refresh_sec"; then
+        if [[ -z "${btrfs_mounts// /}" ]]; then
+            init_btrfs_vols
+            state_set btrfs_vol_list "$(IFS='|'; echo "${btrfs_vols[*]}")"
+            state_set btrfs_label_list "$(IFS='|'; echo "${btrfs_display_labels[*]}")"
+        else
+            IFS='|' read -ra btrfs_vols <<< "$(state_get btrfs_vol_list)"
+        fi
+        for i in "${!btrfs_vols[@]}"; do
+            mount=${btrfs_vols[$i]}
+            key=$(btrfs_vol_key "$mount")
+            pct=$(measure_btrfs_pct "$mount")
+            pct=$(usage_or_zero "$pct")
+            state_set "btrfs_${key}" "$pct"
+        done
+        state_set btrfs_ts "$(now_epoch)"
+    fi
+}
+
+# Fast metrics: loop until deadline (measure_interval_sec × ratio), step = min(cpu,ram,net)_refresh_sec
+refresh_fast_metrics() {
+    local deadline step start cpu_t1 cpu_i1 cpu_t2 cpu_i2 rx1 tx1 rx2 tx2
+    local delta_rx delta_tx bps_rx bps_tx period_ms
+    local cpu_pct ram_pct net_rx_pct net_tx_pct
+    local cpu_sum cpu_cnt max_net_rx max_net_tx net_skip net_hit_rx net_hit_tx
+    local _nl _nc _len_rx _len_tx _floor
+
+    deadline=$(awk -v i="$measure_interval_sec" -v r="$measure_deadline_ratio_pct" 'BEGIN { printf "%.3f", i * r / 100 }')
+    step=$(awk -v c="$cpu_refresh_sec" -v a="$ram_refresh_sec" -v n="$net_refresh_sec" \
+        'BEGIN { s=c; if (a<s) s=a; if (n<s) s=n; print s }')
+
+    cpu_sum=0
+    cpu_cnt=0
+    ram_pct=$(state_get ram_pct)
+    ram_pct=${ram_pct:-0}
+    max_net_rx=0
+    max_net_tx=0
+    net_hit_rx=0
+    net_hit_tx=0
+    net_skip=1
+    state_set net_tx_led 0
+    state_set net_rx_led 0
+
+    read -r cpu_t1 cpu_i1 <<< "$(read_cpu_totals)"
+    rx1=0
+    tx1=0
+    if [[ -n "$interface" && -r "/sys/class/net/$interface/statistics/rx_bytes" ]]; then
+        rx1=$(cat "/sys/class/net/$interface/statistics/rx_bytes")
+        tx1=$(cat "/sys/class/net/$interface/statistics/tx_bytes")
+    fi
+
+    start=$(now_epoch)
+    while awk -v n="$(now_epoch)" -v s="$start" -v d="$deadline" 'BEGIN { exit (n - s) < d ? 0 : 1 }'; do
+        sleep "$step"
+
+        read -r cpu_t2 cpu_i2 <<< "$(read_cpu_totals)"
+        cpu_pct=$(cpu_usage_from_snapshots "$cpu_t1" "$cpu_i1" "$cpu_t2" "$cpu_i2")
+        cpu_sum=$(( cpu_sum + cpu_pct ))
+        cpu_cnt=$(( cpu_cnt + 1 ))
+        cpu_t1=$cpu_t2
+        cpu_i1=$cpu_i2
+
+        ram_pct=$(usage_or_zero "$(measure_ram_pct)")
+
+        if [[ -n "$interface" && -r "/sys/class/net/$interface/statistics/rx_bytes" ]]; then
+            rx2=$(cat "/sys/class/net/$interface/statistics/rx_bytes")
+            tx2=$(cat "/sys/class/net/$interface/statistics/tx_bytes")
+            if (( net_skip )); then
+                net_skip=0
+            else
+                delta_rx=$(( rx2 - rx1 ))
+                delta_tx=$(( tx2 - tx1 ))
+                (( delta_rx < 0 )) && delta_rx=0
+                (( delta_tx < 0 )) && delta_tx=0
+                period_ms=$(awk -v s="$step" 'BEGIN { printf "%.0f", 1000 / s }')
+                bps_rx=$(( delta_rx * period_ms / 1000 ))
+                bps_tx=$(( delta_tx * period_ms / 1000 ))
+                net_rx_pct=$(net_pct_from_bps "$bps_rx")
+                net_tx_pct=$(net_pct_from_bps "$bps_tx")
+                (( net_rx_pct > max_net_rx )) && max_net_rx=$net_rx_pct
+                (( net_tx_pct > max_net_tx )) && max_net_tx=$net_tx_pct
+                (( delta_rx >= net_led_bytes )) && net_hit_rx=1
+                (( delta_tx >= net_led_bytes )) && net_hit_tx=1
+            fi
+            rx1=$rx2
+            tx1=$tx2
+        fi
+    done
+
+    if (( cpu_cnt > 0 )); then
+        cpu_pct=$(( cpu_sum / cpu_cnt ))
+    else
+        cpu_pct=$(state_get cpu_pct)
+        cpu_pct=${cpu_pct:-0}
+    fi
+    cpu_pct=$(usage_or_zero "$cpu_pct")
+
+    if ttbars_flag_on "$net_led_bar_boost"; then
+        if (( net_hit_rx )); then
+            IFS='|' read -r _nl _nc _len_rx < <(get_bar_param net_rx)
+            _floor=$(bar_one_segment_pct "${_len_rx:-3}")
+            (( max_net_rx < _floor )) && max_net_rx=$_floor
+        fi
+        if (( net_hit_tx )); then
+            IFS='|' read -r _nl _nc _len_tx < <(get_bar_param net_tx)
+            _floor=$(bar_one_segment_pct "${_len_tx:-3}")
+            (( max_net_tx < _floor )) && max_net_tx=$_floor
+        fi
+    fi
+
+    state_set cpu_pct "$cpu_pct"
+    state_set ram_pct "$ram_pct"
+    state_set net_rx_pct "$max_net_rx"
+    state_set net_tx_pct "$max_net_tx"
+    state_set net_tx_led "$net_hit_tx"
+    state_set net_rx_led "$net_hit_rx"
+    state_set fast_ts "$(now_epoch)"
+    state_set interface "$interface"
+}
+
+# Generate a pseudographic bar
+# uses for-loops to append ▮/▯-style symbols, avoiding printf and seq for better compatibility and stability.
+# bar appearance color aliases → colourN (tty + tmux fg=): 214 | c214 | color214 | colour214
+_ttbars_norm_color() {
+    local c=${1,,}
+    c=${c#"${c%%[![:space:]]*}"}
+    c=${c%"${c##*[![:space:]]}"}
+    [[ "$c" =~ ^[0-9]+$ ]] && { printf 'colour%s' "$c"; return; }
+    [[ "$c" =~ ^c([0-9]+)$ ]] && { printf 'colour%s' "${BASH_REMATCH[1]}"; return; }
+    [[ "$c" =~ ^colou?r([0-9]+)$ ]] && { printf 'colour%s' "${BASH_REMATCH[1]}"; return; }
+    printf '%s' "$c"
+}
+
+ansi_color_start() {
+    local color="${1:-white}" code n
+    color=$(_ttbars_norm_color "$color")
+    case "$color" in
+        black) code=30 ;;
+        red) code=31 ;;
+        green) code=32 ;;
+        yellow) code=33 ;;
+        blue) code=34 ;;
+        magenta) code=35 ;;
+        cyan) code=36 ;;
+        white) code=37 ;;
+        brightblack) code=90 ;;
+        brightred) code=91 ;;
+        brightgreen) code=92 ;;
+        brightyellow) code=93 ;;
+        brightblue) code=94 ;;
+        brightmagenta) code=95 ;;
+        brightcyan) code=96 ;;
+        brightwhite) code=97 ;;
+        colour[0-9]*|color[0-9]*)
+            n=${color#colour}
+            n=${n#color}
+            [[ "$n" =~ ^[0-9]+$ ]] || n=7
+            printf '\033[38;5;%sm' "$n"
+            return
+            ;;
+        *) code=37 ;;
+    esac
+    printf '\033[%sm' "$code"
+}
+
+ansi_color_reset() {
+    printf '\033[0m'
+}
+
+generate_bar() {
+    local usage="$1" label="$2" color="$3" max_length="$4"
+    local filled unfilled bar i lvl
+    local -a nano_glyphs=(⢀ ⢠ ⢰ ⢸ ⣸ ⣼ ⣾ ⣿)
+    color=$(_ttbars_norm_color "$color")
+    usage=$(usage_or_zero "$usage")
+
+    # Prefix: "LABEL " before the scale; bare scale (no label) — no leading space
+    # (unit join already puts one space between bars). Title-only (length 0) — label without trailing space.
+    if [[ "$_ttbars_out_mode" == "tmux" ]]; then
+        bar="#[fg=$color]"
+    elif [[ "$_ttbars_out_mode" == "tty" ]]; then
+        bar="$(ansi_color_start "$color")"
+    else
+        bar=""
+    fi
+    if [[ -n "$label" ]]; then
+        if [[ "$max_length" == "0" ]]; then
+            bar+="$label"
+        else
+            bar+="${label} "
+        fi
+    fi
+
+    # nano: one-cell minimalist scale ⢀⢠⢰⢸⣸⣼⣾⣿ (0% — space, keeps width)
+    if [[ "$max_length" == "nano" ]]; then
+        if (( usage >= 100 )); then
+            lvl=8
+        elif (( usage > 0 )); then
+            lvl=$(( (usage * 8 + 50) / 100 ))
+            (( lvl < 1 )) && lvl=1
+            (( lvl > 8 )) && lvl=8
+        else
+            lvl=0
+        fi
+        if (( lvl == 0 )); then
+            bar+=' '
+        else
+            bar+=${nano_glyphs[lvl-1]}
+        fi
+    else
+        # empty/non-numeric length (e.g. missing bar id) → 0 segments, no crash
+        [[ "$max_length" =~ ^[0-9]+$ ]] || max_length=0
+        # round to nearest segment; 100% always fills the bar (else length 3: 99*3/100=2)
+        if (( usage >= 100 )); then
+            filled=$max_length
+        else
+            filled=$(( (usage * max_length + 50) / 100 ))
+        fi
+        (( filled > max_length )) && filled=$max_length
+        (( filled < 0 )) && filled=0
+        unfilled=$(( max_length - filled ))
+        for ((i=0; i<filled; i++)); do
+            bar+=$S1
+        done
+        for ((i=0; i<unfilled; i++)); do
+            bar+=$S0
+        done
+    fi
+
+    if [[ "$_ttbars_out_mode" == "tmux" ]]; then
+        bar+="#[default]"
+    elif [[ "$_ttbars_out_mode" == "tty" ]]; then
+        bar+="$(ansi_color_reset)"
+    fi
+    echo "$bar"
+}
+
+# Net label: "idle,led" in net_tx/net_rx; blink=on and hit → second part
+net_pick_label() {
+    local labels=$1 led=${2:-0} idle on
+    [[ "$labels" != *','* ]] && { echo "$labels"; return; }
+    IFS=',' read -r idle on <<< "$labels"
+    if ttbars_flag_on "$net_led_label_blink" && [[ "$led" == "1" && -n "$on" ]]; then
+        echo "$on"
+    else
+        echo "$idle"
+    fi
+}
+
+# Label|color|length from variable named by id (cpu, ram, df, zfs, …).
+# df_usage → df (mount list keeps the name df_usage). Empty label = group/auto (see ttbars_vol_item_label).
+get_bar_param() {
+    local want=$1
+    [[ "$want" == df_usage ]] && want=df
+    printf '%s\n' "${!want}"
+}
+
+# Per-bar label for df/zfs/btrfs:
+#   appearance label empty → item (from *_labels or auto name)
+#   group set, *_labels empty → bare bar (""); group title prepended separately
+#   group set, *_labels set   → item; group title prepended separately
+ttbars_vol_item_label() {
+    local group=$1 conf_labels=$2 item=$3
+    if [[ -n "$group" && -z "$conf_labels" ]]; then
+        echo ""
+    else
+        echo "$item"
+    fi
+}
+
+# Visible string width in columns: strip ANSI sequences (color),
+# count code points — for pseudographics (▪ · ↑ ▲) under UTF-8 that is column count.
+# extglob needed for *(...) ("zero-or-more of class"); enable locally and restore as before.
+_visible_width() {
+    local s=$1 _eg
+    _eg=$(shopt -p extglob)
+    shopt -s extglob
+    s=${s//$'\033'\[*([0-9;])m/}
+    eval "$_eg"
+    printf '%s' "${#s}"
+}
+
+# Terminal width in columns: stty (via /dev/tty — correct inside $() too), then tput, $COLUMNS, else 80.
+# /dev/tty reflects current size (kernel updates winsize on SIGWINCH) → wrap recalculated every frame.
+_ttbars_term_cols() {
+    local c
+    c=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] && { printf '%s' "$c"; return; }
+    c=$(tput cols 2>/dev/null)
+    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] && { printf '%s' "$c"; return; }
+    printf '%s' "${COLUMNS:-80}"
+}
+
+# Pad spaces between label and scale so the scale sits on the right edge (cols).
+# Only for a single "label scale" unit; if no gap or already flush — leave as-is.
+_ttbars_pad_bar() {
+    local cols=$1 unit=$2 label scale lw sw pad
+    [[ "$unit" == *" "* ]] || { printf '%s' "$unit"; return; }
+    label=${unit%% *}
+    scale=${unit#* }
+    lw=$(_visible_width "$label")
+    sw=$(_visible_width "$scale")
+    pad=$(( cols - lw - sw ))
+    (( pad < 1 )) && pad=1
+    printf '%s%*s%s' "$label" "$pad" '' "$scale"
+}
+
+# Sticky group (↑↓): GS between bars. Width = sum of parts + gaps; join with spaces for output.
+_ttbars_grp=$'\035'
+_ttbars_group_width() {
+    local s=$1 total=0 p w
+    local -a parts
+    IFS="$_ttbars_grp" read -ra parts <<< "$s"
+    for p in "${parts[@]}"; do
+        w=$(_visible_width "$p")
+        (( total == 0 )) && total=$w || total=$(( total + 1 + w ))
+    done
+    printf '%s' "$total"
+}
+_ttbars_group_join() {
+    local s=$1 out="" p
+    local -a parts
+    IFS="$_ttbars_grp" read -ra parts <<< "$s"
+    for p in "${parts[@]}"; do
+        [[ -z "$out" ]] && out=$p || out+=" $p"
+    done
+    printf '%s' "$out"
+}
+# Pair alone on a line — stretch the gap so the last bar sits on the right edge.
+_ttbars_group_pad() {
+    local cols=$1 s=$2 w1 w2 pad
+    local -a parts
+    IFS="$_ttbars_grp" read -ra parts <<< "$s"
+    (( ${#parts[@]} == 2 )) || { _ttbars_group_join "$s"; return; }
+    w1=$(_visible_width "${parts[0]}")
+    w2=$(_visible_width "${parts[1]}")
+    pad=$(( cols - w1 - w2 ))
+    (( pad < 1 )) && pad=1
+    printf '%s%*s%s' "${parts[0]}" "$pad" '' "${parts[1]}"
+}
+
+# Group title + bare scales (no per-volume labels): title left, scales pack on the right edge.
+# Detect: first part width≥2 without space (title); remaining parts without space (bare scales).
+_ttbars_titled_bare_group() {
+    local s=$1 p
+    local -a parts
+    IFS="$_ttbars_grp" read -ra parts <<< "$s"
+    (( ${#parts[@]} >= 2 )) || return 1
+    [[ "${parts[0]}" != *" "* ]] || return 1
+    (( $(_visible_width "${parts[0]}") >= 2 )) || return 1
+    for p in "${parts[@]:1}"; do
+        [[ "$p" != *" "* ]] || return 1
+    done
+    return 0
+}
+_ttbars_group_bare_pad() {
+    local cols=$1 s=$2 title bars="" p tw bw pad
+    local -a parts
+    IFS="$_ttbars_grp" read -ra parts <<< "$s"
+    title=${parts[0]}
+    for p in "${parts[@]:1}"; do
+        [[ -z "$bars" ]] && bars=$p || bars+=" $p"
+    done
+    tw=$(_visible_width "$title")
+    bw=$(_visible_width "$bars")
+    pad=$(( cols - tw - bw ))
+    (( pad < 1 )) && pad=1
+    printf '%s%*s%s' "$title" "$pad" '' "$bars"
+}
+
+# Greedy wrap by width: glue units (whole bars/groups) with a space,
+# on overflow past cols start a new line. Skip empty.
+# Unit wider than cols (label+scale don't fit) — split on spaces so the label/scale
+# gap becomes a line break; first piece starts on a new line (don't glue onto previous bar).
+# Sticky group (GS between bars, e.g. ↑↓ or df/ZFS/Btrfs title+bars): fit/move as a whole;
+# only split if the group itself > cols (then break before the group, emit parts).
+# Solo bar on a line — pad after the label so the scale aligns to the right edge.
+# Solo titled bare group (ZFS + nanos) — title left, bare scales on the right edge.
+# Solo ↑↓ pair — stretch so the last bar sits on the right edge only when the printed
+# block is no longer a wide landscape: glyph ≈ 2× taller than wide, so visual aspect is
+# cols/(2*rows); stretch when that drops below ~6 (≡ 12*rows > cols). Pure 2*rows > cols
+# is too strict (almost never fires). Wide 2-line overflow (all bars + net) stays unstretched.
+_ttbars_wrap() {
+    local cols=$1; shift
+    local line="" line_w=0 line_n=0 unit w joined
+    local brk=$'\036'   # internal: force newline before following atoms (from a split bar)
+    local -a atoms=() parts lines=()
+    for unit in "$@"; do
+        unit=${unit% }
+        [[ -z "$unit" ]] && continue
+        if [[ "$unit" == *"$_ttbars_grp"* ]]; then
+            w=$(_ttbars_group_width "$unit")
+            if (( w > cols )); then
+                # pair itself wider than screen — fall back to per-bar (may split label/scale)
+                IFS="$_ttbars_grp" read -ra parts <<< "$unit"
+                atoms+=("$brk")
+                local p pw
+                for p in "${parts[@]}"; do
+                    pw=$(_visible_width "$p")
+                    if (( pw > cols )) && [[ "$p" == *" "* ]]; then
+                        local -a sub
+                        IFS=' ' read -ra sub <<< "$p"
+                        atoms+=("${sub[@]}")
+                    else
+                        atoms+=("$p")
+                    fi
+                done
+            else
+                atoms+=("$unit")
+            fi
+            continue
+        fi
+        w=$(_visible_width "$unit")
+        if (( w > cols )) && [[ "$unit" == *" "* ]]; then
+            IFS=' ' read -ra parts <<< "$unit"
+            atoms+=("$brk" "${parts[@]}")
+        else
+            atoms+=("$unit")
+        fi
+    done
+    for unit in "${atoms[@]}"; do
+        if [[ "$unit" == "$brk" ]]; then
+            (( line_w > 0 )) && line_w=$cols
+            continue
+        fi
+        [[ -z "$unit" ]] && continue
+        if [[ "$unit" == *"$_ttbars_grp"* ]]; then
+            w=$(_ttbars_group_width "$unit")
+            IFS="$_ttbars_grp" read -ra parts <<< "$unit"
+            if (( line_w == 0 )); then
+                # keep GS until emit — pad only if printed block is geometrically vertical
+                line=$unit; line_w=$w; line_n=${#parts[@]}
+            elif (( line_w + 1 + w <= cols )); then
+                joined=$(_ttbars_group_join "$unit")
+                line+=" $joined"; line_w=$(( line_w + 1 + w )); line_n=$(( line_n + ${#parts[@]} ))
+            else
+                (( line_n == 1 )) && line=$(_ttbars_pad_bar "$cols" "$line")
+                lines+=("$line")
+                line=$unit; line_w=$w; line_n=${#parts[@]}
+            fi
+            continue
+        fi
+        w=$(_visible_width "$unit")
+        if (( line_w == 0 )); then
+            line=$unit; line_w=$w; line_n=1
+        elif (( line_w + 1 + w <= cols )); then
+            line+=" $unit"; line_w=$(( line_w + 1 + w )); line_n=$(( line_n + 1 ))
+        else
+            (( line_n == 1 )) && line=$(_ttbars_pad_bar "$cols" "$line")
+            lines+=("$line")
+            line=$unit; line_w=$w; line_n=1
+        fi
+    done
+    if (( line_n > 0 )); then
+        (( line_n == 1 )) && line=$(_ttbars_pad_bar "$cols" "$line")
+        lines+=("$line")
+    fi
+    local i n=${#lines[@]}
+    for (( i=0; i<n; i++ )); do
+        if [[ "${lines[i]}" == *"$_ttbars_grp"* ]]; then
+            if _ttbars_titled_bare_group "${lines[i]}"; then
+                # group title + bare scales alone on the line → scales to the right edge
+                printf '%s\n' "$(_ttbars_group_bare_pad "$cols" "${lines[i]}")"
+            elif (( 12 * n > cols )); then
+                # visual aspect cols/(2*n) < 6 → stretch ↑↓ pair (see comment above)
+                printf '%s\n' "$(_ttbars_group_pad "$cols" "${lines[i]}")"
+            else
+                printf '%s\n' "$(_ttbars_group_join "${lines[i]}")"
+            fi
+        else
+            printf '%s\n' "${lines[i]}"
+        fi
+    done
+}
+
+# Bar line from state (no df/zpool/fast cycle).
+ttbars_render_from_state() {
+    local cpu_bar ram_bar df_bars zfs_bars btrfs_bars net_bars
+    local _bar_label _bar_color _bar_len pool label mount key up_bar down_bar
+    local -a df_vols df_display_labels zfs_pool_names zfs_display_labels btrfs_vols btrfs_display_labels
+    local sep=$'\037'   # marker between bars inside groups (US) — cut per pool/volume, not whole group
+
+    IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param cpu)
+    cpu_bar=$(generate_bar "$(state_get cpu_pct)" "$_bar_label" "$_bar_color" "$_bar_len")
+    IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param ram)
+    ram_bar=$(generate_bar "$(state_get ram_pct)" "$_bar_label" "$_bar_color" "$_bar_len")
+
+    df_bars=""
+    if [[ -n "$(state_get df_vol_list)" ]]; then
+        IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param df_usage)
+        IFS='|' read -ra df_vols <<< "$(state_get df_vol_list)"
+        IFS='|' read -ra df_display_labels <<< "$(state_get df_label_list)"
+        # Non-empty df/zfs/btrfs label → group title unit (length 0), then bars
+        [[ -n "$_bar_label" ]] && df_bars+="$(generate_bar 0 "$_bar_label" "$_bar_color" 0)$sep"
+        for i in "${!df_vols[@]}"; do
+            mount=${df_vols[$i]}
+            key=$(df_vol_key "$mount")
+            label=$(ttbars_vol_item_label "$_bar_label" "$df_labels" \
+                "${df_display_labels[$i]:-$(basename "$mount")}")
+            df_bars+="$(generate_bar "$(state_get "df_${key}")" "$label" "$_bar_color" "$_bar_len")$sep"
+        done
+    fi
+
+    zfs_bars=""
+    if [[ -n "$(state_get zfs_pool_list)" ]]; then
+        IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param zfs)
+        IFS=',' read -ra zfs_pool_names <<< "$(state_get zfs_pool_list)"
+        IFS=',' read -ra zfs_display_labels <<< "$(state_get zfs_label_list)"
+        [[ -n "$_bar_label" ]] && zfs_bars+="$(generate_bar 0 "$_bar_label" "$_bar_color" 0)$sep"
+        for i in "${!zfs_pool_names[@]}"; do
+            pool=${zfs_pool_names[$i]}
+            label=$(ttbars_vol_item_label "$_bar_label" "$zfs_labels" \
+                "${zfs_display_labels[$i]:-$pool}")
+            zfs_bars+="$(generate_bar "$(state_get "zfs_${pool}")" "$label" "$_bar_color" "$_bar_len")$sep"
+        done
+    fi
+
+    btrfs_bars=""
+    if [[ -n "$(state_get btrfs_vol_list)" ]]; then
+        IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param btrfs)
+        IFS='|' read -ra btrfs_vols <<< "$(state_get btrfs_vol_list)"
+        IFS='|' read -ra btrfs_display_labels <<< "$(state_get btrfs_label_list)"
+        [[ -n "$_bar_label" ]] && btrfs_bars+="$(generate_bar 0 "$_bar_label" "$_bar_color" 0)$sep"
+        for i in "${!btrfs_vols[@]}"; do
+            mount=${btrfs_vols[$i]}
+            key=$(btrfs_vol_key "$mount")
+            label=$(ttbars_vol_item_label "$_bar_label" "$btrfs_labels" \
+                "${btrfs_display_labels[$i]:-$(basename "$mount")}")
+            btrfs_bars+="$(generate_bar "$(state_get "btrfs_${key}")" "$label" "$_bar_color" "$_bar_len")$sep"
+        done
+    fi
+
+    net_bars=""
+    if [[ -n "$(state_get interface)" || -n "$interface" ]]; then
+        IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param net_tx)
+        _bar_label=$(net_pick_label "$_bar_label" "$(state_get net_tx_led)")
+        up_bar=$(generate_bar "$(state_get net_tx_pct)" "$_bar_label" "$_bar_color" "$_bar_len")
+        IFS='|' read -r _bar_label _bar_color _bar_len < <(get_bar_param net_rx)
+        _bar_label=$(net_pick_label "$_bar_label" "$(state_get net_rx_led)")
+        down_bar=$(generate_bar "$(state_get net_rx_pct)" "$_bar_label" "$_bar_color" "$_bar_len")
+        net_bars="$up_bar $down_bar "
+    fi
+
+    # tty: wrap to terminal width on whole-bar boundaries.
+    # df / ZFS / Btrfs = sticky group (title+bars move together; GS); ↑↓ sticky pair.
+    # tmux/plain: one line as before (marker → space; wrap is up to tmux / the pipe consumer).
+    if [[ "$_ttbars_out_mode" == "tty" ]]; then
+        local -a _units=("$cpu_bar" "$ram_bar")
+        local _sticky
+        if [[ -n "$df_bars" ]]; then
+            _sticky=${df_bars%$sep}
+            _units+=("${_sticky//$sep/$_ttbars_grp}")
+        fi
+        if [[ -n "$zfs_bars" ]]; then
+            _sticky=${zfs_bars%$sep}
+            _units+=("${_sticky//$sep/$_ttbars_grp}")
+        fi
+        if [[ -n "$btrfs_bars" ]]; then
+            _sticky=${btrfs_bars%$sep}
+            _units+=("${_sticky//$sep/$_ttbars_grp}")
+        fi
+        [[ -n "$net_bars" ]] && _units+=("${up_bar}${_ttbars_grp}${down_bar}")
+        _ttbars_wrap "$(_ttbars_term_cols)" "${_units[@]}"
+    else
+        echo "$cpu_bar $ram_bar ${df_bars//$sep/ }${zfs_bars//$sep/ }${btrfs_bars//$sep/ }${net_bars}"
+    fi
+}
+
+# Watch: instant frame from ~/.cache/ttbars.state (no measurements).
+ttbars_frame_cached() {
+    mkdir -p "${state_file%/*}" 2>/dev/null || true
+    state_load
+    [[ -z "$interface" && -n "$(state_get interface)" ]] && interface=$(state_get interface)
+    ttbars_render_from_state
+}
+
+# --- main flow (not run when TTBARS_TEST=1 — see tests/run.sh) ---
+ttbars_main() {
+    mkdir -p "${state_file%/*}" 2>/dev/null || true
+    state_load
+    init_net_interface
+    [[ -z "$interface" && -n "$(state_get interface)" ]] && interface=$(state_get interface)
+    init_net_speed
+
+    _df_conf_dirty=0
+    _zfs_conf_dirty=0
+    _btrfs_conf_dirty=0
+    refresh_slow_metrics
+
+    if (( _df_conf_dirty || _zfs_conf_dirty || _btrfs_conf_dirty )) || refresh_due "$(state_get fast_ts)" "$measure_interval_sec"; then
+        (
+            flock -n 200 || exit 0
+            if refresh_due "$(state_get fast_ts)" "$measure_interval_sec"; then
+                refresh_fast_metrics
+            fi
+            state_save
+        ) 200>"$state_lock"
+        state_load
+    fi
+
+    ttbars_render_from_state
+}
+
+ttbars_watch_loop() {
+    local frame key now start first=1 cols prev_cols="" wi=$measure_interval_sec conf_sig conf_last _winch=0
+    conf_last=$(_ttbars_conf_mtime)
+    # Clear the screen only once; then redraw from top-left without black flicker.
+    printf '\033[?25l\033[H\033[2J'
+    # Echo off for the whole watch: read -s only covers the read itself; q during measure would print.
+    stty -echo </dev/tty 2>/dev/null || true
+    trap 'exit 0' INT TERM
+    trap 'stty echo </dev/tty 2>/dev/null; printf "\033[0m\033[?25h\n"' EXIT
+    trap '_winch=1' WINCH   # handle resize immediately, don't wait for end of interval
+    while :; do
+        # conf may have changed (pool/volume list edit). Reload on mtime change, else a long-lived
+        # watch keeps the old list and fights other processes over shared state → labels "blink".
+        # Watch interval is fixed: CLI -t wins over conf.
+        conf_sig=$(_ttbars_conf_mtime)
+        if [[ "$conf_sig" != "$conf_last" ]]; then
+            _ttbars_load_conf
+            measure_interval_sec=$wi
+            conf_last=$conf_sig
+        fi
+        if (( first )); then
+            frame=$(ttbars_frame_cached)
+            # Trailing \n: $(...) strips final newlines; without it \033[J right after a
+            # full-width last line eats the last glyph (↓ loses a scale segment on shrink).
+            printf '\033[H%s\n\033[J' "$frame"
+            first=0
+        fi
+        frame=$(ttbars_main)
+        # On resize the terminal reflows the old multi-line frame to the new width — layout "drifts",
+        # and \033[J does not clear that reflow. Full clear (\033[2J) only on width change, in one
+        # printf together with the frame — else between clear and a slow measure the screen blanks ("bars vanish").
+        cols=$(_ttbars_term_cols)
+        if [[ "$cols" != "$prev_cols" ]]; then
+            printf '\033[2J\033[H%s\n\033[J' "$frame"
+            prev_cols=$cols
+        else
+            printf '\033[H%s\n\033[J' "$frame"
+        fi
+        start=$(now_epoch)
+        while :; do
+            # Quit without Enter (like a TUI): always q/Q, plus characters from quit_chars (layouts).
+            if read -r -s -n 1 -t 0.1 key </dev/tty; then
+                [[ "$key" == "q" || "$key" == "Q" || ( -n "$key" && "${quit_chars:0:10}" == *"$key"* ) ]] && return 0
+            fi
+            # On SIGWINCH re-render a frame from state at the new width immediately (no measures, cheap) —
+            # else bar wrap would wait for end of interval. Full clear removes reflow of the old frame.
+            if (( _winch )); then
+                _winch=0
+                cols=$(_ttbars_term_cols)
+                if [[ "$cols" != "$prev_cols" ]]; then
+                    frame=$(ttbars_frame_cached)
+                    printf '\033[2J\033[H%s\n\033[J' "$frame"
+                    prev_cols=$cols
+                fi
+            fi
+            now=$(now_epoch)
+            if awk -v n="$now" -v s="$start" -v p="$measure_interval_sec" 'BEGIN { exit (n - s) >= p ? 0 : 1 }'; then
+                break
+            fi
+        done
+    done
+}
+
+if [[ "${TTBARS_TEST:-}" != "1" ]]; then
+    _ttbars_parse_args "$@"
+    _ttbars_apply_tmux_interval
+    _ttbars_detect_out_mode
+    if (( _ttbars_watch_mode )); then
+        ttbars_watch_loop
+    else
+        ttbars_main
+    fi
+fi
+
+# Author: VladList — https://github.com/RootFromHell/ttmux
+#
+# MIT License
+#
+# Copyright (c) 2026 VladList
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.

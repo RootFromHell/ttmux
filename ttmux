@@ -1,0 +1,256 @@
+#!/bin/bash
+set -euo pipefail
+
+# Defaults baked into a NEW ~/.config/ttmux.conf only (first run).
+# Later changes: edit that file — not these lines (e.g. clearing 'mc' here does nothing).
+ttmux_pane_left_run=''
+ttmux_pane_right_run='mc'
+ttmux_pane_bottom_run=''
+ttmux_pane_right_width_pct=70               # right pane width in percent
+ttmux_pane_bottom_height=1                  # bottom pane height in rows
+
+# Pure tmux block for a new conf (launcher lines are written from the variables above)
+_ttmux_tmux_defaults=$(cat <<'EOF'
+# Typical tmux settings
+set -g mouse on                             # mouse window control. Disable if selection breaks in nano
+set-option -g set-clipboard on
+# colors
+set -g default-terminal "screen-256color"   
+set -g pane-active-border-style fg=magenta  # 💡 Colors — standard name or colour1–256 
+set -g pane-border-style fg=brightblack     # red, blue, brightblue, colour107, etc.
+set -g status-bg black                      # ⚠️ not 107/c107/color107 
+set -g status-fg colour107
+# status-line settings
+set -g status-left '#(ttbars -tmux)'        # attach ttbars in tmux plugin mode
+set -g status-interval 1                    # ttbars syncs with this setting
+set -g status-left-length 100
+set -g status-right-length 100
+set -g status-justify left
+set -g status-right '#H %H:%M:%S'           # host and time on the right of the status line
+EOF
+)
+
+ver=0+1🆙                 # 🚀 TurboTmux: project started
+
+# bash drops the # comment from ver= — for -v read hash + subject from this file's source line
+_ttmux_print_ver() {
+    local line hash cmt
+    line=$(grep -m1 '^ver=' "$0" 2>/dev/null) || { echo "$ver"; return; }
+    if [[ "$line" =~ ^ver=([^[:space:]#]+)[[:space:]]+#[[:space:]]*(.*)$ ]]; then
+        hash=${BASH_REMATCH[1]}
+        cmt=${BASH_REMATCH[2]}
+        cmt=${cmt%"${cmt##*[![:space:]]}"}
+        echo "$hash # $cmt"
+    else
+        echo "$ver"
+    fi
+}
+
+case "${1:-}" in
+    -v|--version) _ttmux_print_ver; exit 0 ;;
+esac
+
+# Manual install may skip tmux; fail early instead of "command not found" at attach
+command -v tmux &>/dev/null || {
+    echo "⚠️ ttmux: tmux not found — install it (e.g. apt install tmux)" >&2
+    exit 1
+}
+
+# create default ttmux config if it does not exist
+_ttmux_write_default_conf() {
+    local conf="${XDG_CONFIG_HOME:-$HOME/.config}/ttmux.conf"
+    {
+        cat <<EOF
+# TurboTmux parameters: autostart commands for ttmux panes
+ttmux_pane_left_run='${ttmux_pane_left_run}'
+ttmux_pane_right_run='${ttmux_pane_right_run}'
+ttmux_pane_bottom_run='${ttmux_pane_bottom_run}'
+ttmux_pane_right_width_pct=${ttmux_pane_right_width_pct}               # right pane width in percent
+ttmux_pane_bottom_height=${ttmux_pane_bottom_height}                    # bottom pane height in rows
+
+EOF
+        printf '%s\n' "$_ttmux_tmux_defaults"
+    } >"$conf"
+}
+
+_ttmux_msg() {
+    if [[ -w /dev/tty ]]; then
+        printf '%s' "$1" >/dev/tty
+    else
+        printf '%s' "$1" >&2
+    fi
+}
+
+# Before attach to the terminal (not after leaving tmux)
+_ttmux_warn_unquoted_layout() {
+    local key=$1 raw=$2 trimmed
+    trimmed=${raw%%#*}
+    trimmed=${trimmed#"${trimmed%%[![:space:]]*}"}
+    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+    [[ -n "$trimmed" ]] || return 0
+    [[ "$trimmed" == \'*\' && ${#trimmed} -ge 2 ]] && return 0
+    [[ "$trimmed" == \"*\" && ${#trimmed} -ge 2 ]] && return 0
+    [[ "$trimmed" =~ [[:space:]] ]] || return 0
+    _ttmux_msg "ttmux: warning: ttmux_pane_${key}_run: quote commands with spaces (e.g. 'cd /tmp')\n"
+}
+
+# ttmux_pane_*_run=… lines — launcher only; tmux never sees them
+_ttmux_read_layout() {
+    local conf=$1 line key val raw
+    [[ -r "$conf" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*(ttmux_pane_(left|right|bottom)_run)=(.*)$ ]]; then
+            key=${BASH_REMATCH[2]}
+            raw=${BASH_REMATCH[3]}
+            _ttmux_warn_unquoted_layout "$key" "$raw"
+            val=${raw%%#*}
+            val=${val#"${val%%[![:space:]]*}"}
+            val=${val%"${val##*[![:space:]]}"}
+            val=${val#\"}; val=${val%\"}
+            val=${val#\'}; val=${val%\'}
+            case "$key" in
+                left) ttmux_pane_left_run=$val ;;
+                right) ttmux_pane_right_run=$val ;;
+                bottom) ttmux_pane_bottom_run=$val ;;
+            esac
+        elif [[ "$line" =~ ^[[:space:]]*ttmux_pane_right_width_pct=(.*)$ ]]; then
+            raw=${BASH_REMATCH[1]}
+            val=${raw%%#*}
+            val=${val#"${val%%[![:space:]]*}"}
+            val=${val%"${val##*[![:space:]]}"}
+            [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 100 ]] && ttmux_pane_right_width_pct=$val
+        elif [[ "$line" =~ ^[[:space:]]*ttmux_pane_bottom_height=(.*)$ ]]; then
+            raw=${BASH_REMATCH[1]}
+            val=${raw%%#*}
+            val=${val#"${val%%[![:space:]]*}"}
+            val=${val%"${val##*[![:space:]]}"}
+            [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] && ttmux_pane_bottom_height=$val
+        fi
+    done <"$conf"
+}
+
+_ttmux_right_pane_width() {
+    local cols pct=$ttmux_pane_right_width_pct
+    cols=$(tput cols 2>/dev/null || true)
+    [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]] || cols=${COLUMNS:-120}
+    [[ "$pct" =~ ^[0-9]+$ && "$pct" -ge 1 && "$pct" -le 100 ]] || pct=70
+    echo $(( cols * pct / 100 ))
+}
+
+# Config without launcher lines — else tmux breaks on "ttbars -t 1" and ttmux_pane_*=
+_ttmux_filter_conf() {
+    grep -Ev '^[[:space:]]*ttmux_pane_(left|right|bottom)_run=|^[[:space:]]*ttmux_pane_right_width_pct=|^[[:space:]]*ttmux_pane_bottom_height=' "$1"
+}
+
+# Non-empty command → "cmd; bash -l", else "bash -l"
+_ttmux_pane_shell() {
+    local run=$1
+    if [[ -n "${run//[[:space:]]/}" ]]; then
+        printf '%s; bash -l' "$run"
+    else
+        printf 'bash -l'
+    fi
+}
+
+# If the pane command is missing — warn and fall back to a bare shell (no "command not found" in the pane).
+_ttmux_pane_shell_or_warn() {
+    local key=$1 run=$2 cmd
+    if [[ -z "${run//[[:space:]]/}" ]]; then
+        _ttmux_pane_shell ""
+        return
+    fi
+    cmd=${run%%[[:space:]]*}
+    if [[ "$cmd" != /* ]] && ! command -v "$cmd" &>/dev/null; then
+        _ttmux_msg "⚠️ ttmux: $cmd not installed — install it or change ttmux_pane_${key}_run"$'\n'
+        _ttmux_pane_shell ""
+        return
+    fi
+    if [[ "$cmd" == /* && ! -x "$cmd" ]]; then
+        _ttmux_msg "⚠️ ttmux: $cmd not installed — install it or change ttmux_pane_${key}_run"$'\n'
+        _ttmux_pane_shell ""
+        return
+    fi
+    _ttmux_pane_shell "$run"
+}
+
+# Seed ~/.config/mc if the user has no mc config yet (skin, arrows, right panel → /home).
+_ttmux_seed_mc_config() {
+    local mc_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mc"
+    [[ -e "$mc_dir/ini" ]] && return 0
+    mkdir -p "$mc_dir"
+    cat <<'EOF' >"$mc_dir/ini"
+[Midnight-Commander]
+skin=modarin256root-defbg-thin
+[Colors]
+xterm-256color=
+[Panels]
+navigate_with_arrows=true
+EOF
+    cat <<'EOF' >"$mc_dir/panels.ini"
+[Dirs]
+current_is_left=true
+other_dir=/home
+EOF
+}
+
+_ttmux_conf() {
+    local conf="${XDG_CONFIG_HOME:-$HOME/.config}/ttmux.conf"
+    [[ -r "$conf" ]] || _ttmux_write_default_conf
+    [[ -r "$conf" ]] && echo "$conf" && return 0
+    return 1
+}
+
+_ttmux_conf_runtime=""
+_ttmux_cleanup() {
+    [[ -n "$_ttmux_conf_runtime" ]] && rm -f "$_ttmux_conf_runtime"
+}
+trap _ttmux_cleanup EXIT
+
+if conf=$(_ttmux_conf); then
+    _ttmux_read_layout "$conf"
+    _ttmux_conf_runtime=$(mktemp)
+    _ttmux_filter_conf "$conf" >"$_ttmux_conf_runtime"
+    TMUX=(tmux -f "$_ttmux_conf_runtime")
+else
+    TMUX=(tmux)
+fi
+
+_right_w=$(_ttmux_right_pane_width)
+_ttmux_seed_mc_config
+
+# create ttmux session with three panes
+"${TMUX[@]}" attach -t ttmux 2>/dev/null && exit 0
+
+_left=$(_ttmux_pane_shell_or_warn left "$ttmux_pane_left_run")
+_right=$(_ttmux_pane_shell_or_warn right "$ttmux_pane_right_run")
+_bottom=$(_ttmux_pane_shell_or_warn bottom "$ttmux_pane_bottom_run")
+
+"${TMUX[@]}" new-session -s ttmux "$_left" \; \
+  split-window -v "$_bottom" \; resize-pane -y "$ttmux_pane_bottom_height" \; \
+select-pane -t 0 \; \
+  split-window -h "$_right" \; resize-pane -x "$_right_w" \; \
+select-pane -t 1 \;
+
+# Author: VladList — https://github.com/RootFromHell/ttmux
+#
+# MIT License
+#
+# Copyright (c) 2026 VladList
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.

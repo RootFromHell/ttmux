@@ -1,0 +1,214 @@
+#!/bin/bash
+# 🏷️ Stamp version into versioned files. Manual run and call from post-commit.
+# Usage:
+#   scripts/versioning/stamp-version --hash 'abc1234+1🆙' --comment 'subject' ttbars
+#   scripts/versioning/stamp-version          # ver=HEAD+1🆙; files from HEAD commit ∩ versioned
+# 📤 Prints to stdout paths where the stamp actually changed (one per line).
+#
+# 📋 Rules (shell list — VERSIONED_SHELL below):
+#   shell files from VERSIONED_SHELL — ver=… line; optional # comment = commit subject
+#   *.md — <!-- ver: … --> (optional # subject); stamp only if the marker already exists
+#
+# 💡 Stamp format: <short-HEAD>+1🆙 — "commit after parent" (written in post-commit, then amend).
+# 💡 Shell: keep the column of `#` on the ver= line (do not invent padding). Md: <!-- ver: HASH --> or <!-- ver: HASH # subject -->.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+
+# 📜 Shell files that carry a ver= stamp
+VERSIONED_SHELL=(ttbars ttmux)
+
+_is_versioned_shell() {
+    local base=$1 name
+    for name in "${VERSIONED_SHELL[@]}"; do
+        [[ "$base" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $0 [--hash VER] [--comment SUBJECT] [file...]
+
+  With no file — take paths from git diff-tree HEAD, keep versioned only.
+  With no --hash — \$(git rev-parse --short HEAD)+1🆙
+  --comment — set trailing # … on ver= / <!-- ver: … --> (shell keeps # column on the ver= line).
+  Versioned: ${VERSIONED_SHELL[*]} (ver=…); *.md with <!-- ver: … --> marker.
+
+EOF
+}
+
+# ver=… → 0 if file changed, 1 if skipped
+# $3 optional commit subject for the # comment
+_stamp_ver_eq() {
+    local file=$1 ver=$2 comment=${3-}
+    local old old_cmt
+    [[ -f "$file" ]] || return 1
+    old=$(sed -nE 's/^ver=([^[:space:]#]+).*/\1/p' "$file" | head -n1)
+    [[ -n "$old" ]] || return 1
+    old_cmt=$(sed -nE 's/^ver=[^[:space:]#]+[[:space:]]+#[[:space:]]*(.*)/\1/p' "$file" | head -n1)
+    if [[ -n "$comment" ]]; then
+        [[ "$old" == "$ver" && "$old_cmt" == "$comment" ]] && return 1
+        # Keep the column of `#` on this line; only replace hash and subject text.
+        awk -v ver="$ver" -v cmt="$comment" '
+            /^ver=/ {
+                prefix = "ver=" ver
+                if (match($0, /#/)) {
+                    n = RSTART - length(prefix) - 1
+                    if (n < 1) n = 1
+                    printf "%s%*s# %s\n", prefix, n, "", cmt
+                } else {
+                    print prefix " # " cmt
+                }
+                next
+            }
+            { print }
+        ' "$file" >"${file}.stamp-tmp" && cat "${file}.stamp-tmp" >"$file" && rm -f "${file}.stamp-tmp"
+    else
+        [[ "$old" == "$ver" ]] && return 1
+        # Hash-only: keep # column if a comment exists
+        awk -v ver="$ver" '
+            /^ver=/ {
+                if (match($0, /#/)) {
+                    cmt = substr($0, RSTART + 1)
+                    sub(/^[[:space:]]*/, "", cmt)
+                    prefix = "ver=" ver
+                    n = RSTART - length(prefix) - 1
+                    if (n < 1) n = 1
+                    printf "%s%*s# %s\n", prefix, n, "", cmt
+                } else {
+                    print "ver=" ver
+                }
+                next
+            }
+            { print }
+        ' "$file" >"${file}.stamp-tmp" && cat "${file}.stamp-tmp" >"$file" && rm -f "${file}.stamp-tmp"
+    fi
+    return 0
+}
+
+# <!-- ver: HASH --> or <!-- ver: HASH # subject --> → 0 if changed, 1 if no marker / same
+_stamp_md_ver() {
+    local file=$1 ver=$2 comment=${3-}
+    local old old_cmt
+    [[ -f "$file" ]] || return 1
+    old=$(sed -nE 's/.*<!-- ver: ([^[:space:]]+).*/\1/p' "$file" | head -n1)
+    [[ -n "$old" ]] || return 1
+    old_cmt=$(sed -nE 's/.*<!-- ver: [^[:space:]]+[[:space:]]+#[[:space:]]*(.*) -->.*/\1/p' "$file" | head -n1)
+    if [[ -n "$comment" ]]; then
+        [[ "$old" == "$ver" && "$old_cmt" == "$comment" ]] && return 1
+        awk -v ver="$ver" -v cmt="$comment" '
+            /<!-- ver: / {
+                sub(/<!-- ver: [^>]+ -->/, "<!-- ver: " ver " # " cmt " -->")
+            }
+            { print }
+        ' "$file" >"${file}.stamp-tmp" && cat "${file}.stamp-tmp" >"$file" && rm -f "${file}.stamp-tmp"
+    else
+        [[ "$old" == "$ver" ]] && return 1
+        # Update hash only; keep optional " # subject" if present
+        awk -v ver="$ver" '
+            /<!-- ver: / {
+                sub(/<!-- ver: [^[:space:]]+/, "<!-- ver: " ver)
+            }
+            { print }
+        ' "$file" >"${file}.stamp-tmp" && cat "${file}.stamp-tmp" >"$file" && rm -f "${file}.stamp-tmp"
+    fi
+    return 0
+}
+
+_is_versioned() {
+    local rel=$1 base
+    base=$(basename "$rel")
+    _is_versioned_shell "$base" && return 0
+    [[ "$rel" == *.md ]] && return 0
+    return 1
+}
+
+_stamp_file() {
+    local rel=$1 ver=$2 comment=$3 base
+    base=$(basename "$rel")
+    if _is_versioned_shell "$base"; then
+        _stamp_ver_eq "$ROOT/$rel" "$ver" "$comment"
+    elif [[ "$rel" == *.md ]]; then
+        _stamp_md_ver "$ROOT/$rel" "$ver" "$comment"
+    else
+        return 1
+    fi
+}
+
+_rel_from_arg() {
+    local arg=$1
+    if [[ "$arg" == /* ]]; then
+        realpath -s --relative-to="$ROOT" "$arg" 2>/dev/null || {
+            echo "${arg#"$ROOT"/}"
+        }
+    else
+        echo "${arg#./}"
+    fi
+}
+
+ver=""
+comment=""
+files=()
+while (($#)); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --hash)
+            [[ $# -ge 2 ]] || { echo "$0: --hash needs an argument" >&2; exit 1; }
+            ver=$2
+            shift 2
+            ;;
+        --hash=*)
+            ver=${1#*=}
+            shift
+            ;;
+        --comment)
+            [[ $# -ge 2 ]] || { echo "$0: --comment needs an argument" >&2; exit 1; }
+            comment=$2
+            shift 2
+            ;;
+        --comment=*)
+            comment=${1#*=}
+            shift
+            ;;
+        -*)
+            echo "$0: unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+        *)
+            files+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$ver" ]]; then
+    ver="$(git -C "$ROOT" rev-parse --short HEAD)+1🆙"
+fi
+# short-hash or short-hash+1🆙
+[[ "$ver" =~ ^[0-9a-fA-F]+(\+1🆙)?$ ]] || { echo "$0: bad ver: $ver" >&2; exit 1; }
+
+# one-line subject, trim, max 80 chars (matches typical -m style from history)
+if [[ -n "$comment" ]]; then
+    comment=$(printf '%s' "$comment" | tr -d '\r' | head -n1)
+    comment="${comment#"${comment%%[![:space:]]*}"}"
+    comment="${comment%"${comment##*[![:space:]]}"}"
+    ((${#comment} > 80)) && comment="${comment:0:80}"
+fi
+
+if ((${#files[@]} == 0)); then
+    mapfile -t files < <(git -C "$ROOT" diff-tree --no-commit-id --name-only --root -r HEAD)
+fi
+
+declare -A seen=()
+for arg in "${files[@]}"; do
+    rel=$(_rel_from_arg "$arg")
+    _is_versioned "$rel" || continue
+    [[ -z "${seen[$rel]+x}" ]] || continue
+    seen[$rel]=1
+    if _stamp_file "$rel" "$ver" "$comment"; then
+        printf '%s\n' "$rel"
+    fi
+done
